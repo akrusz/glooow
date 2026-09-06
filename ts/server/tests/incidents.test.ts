@@ -86,6 +86,20 @@ describe('incident log - LLM route', () => {
         expect(row.detail).toBe('finish=length tokens_out=300 tokens_in=100');
     });
 
+    it('does not flag a streamed turn whose text arrived in deltas before the empty done chunk', async () => {
+        const forwarder = {
+            async *stream() {
+                yield { text: 'Let the breath settle.', done: false } as never;
+                yield { text: '', done: true, finishReason: 'stop', inputTokens: 3, outputTokens: 25 } as never;
+            },
+        } as unknown as Forwarder;
+        const { deps, app, token } = await setup(forwarder);
+        const res = await complete(app, token, true);
+        expect(res.status).toBe(200);
+        await res.text();
+        expect(await deps.store.incidentsSince(0)).toHaveLength(0);
+    });
+
     it.each([true, false])('records llm_error on an upstream failure, first line only (stream=%s)', async (stream) => {
         const { deps, app, token } = await setup(failingForwarder());
         const res = await complete(app, token, stream);

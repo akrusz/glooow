@@ -211,8 +211,13 @@ export function llmRoutes(deps: Deps): Hono<{ Variables: AuthVars }> {
                 let settled = false;
                 try {
                     let final: CompleteResponse | undefined;
+                    // The done chunk carries usage, not the reply: adapters
+                    // emit it with empty text, so "blank turn" has to be
+                    // judged from the deltas that streamed before it.
+                    let sawText = false;
                     for await (const chunk of deps.forwarder.stream(body.messages!, fwd)) {
                         if (!chunk.done) {
+                            if (chunk.text.trim()) sawText = true;
                             await sse.writeSSE({ data: JSON.stringify({ text: chunk.text, done: false } satisfies CompleteChunk) });
                             continue;
                         }
@@ -221,7 +226,7 @@ export function llmRoutes(deps: Deps): Hono<{ Variables: AuthVars }> {
                         if (holdId) await deps.ledger.settleHold(account.id, holdId, cost.credits, reason);
                         settled = true;
                         await recordLlmUsage(deps, account.id, body.provider!, body.model!, usage, cost, pass?.id ?? null, sessionId);
-                        if (!chunk.text.trim()) {
+                        if (!sawText && !chunk.text.trim()) {
                             void recordIncident(deps.store, {
                                 accountId: account.id,
                                 kind: 'llm_empty',
