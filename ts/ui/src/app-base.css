@@ -1338,6 +1338,9 @@ option.provider-unavailable {
     font-size: 1rem;
     border-radius: var(--radius);
     box-shadow: 3px 3px 0 var(--brand-stroke);
+    /* The sticker shadow hangs 3px below the box; give it that much margin
+       so the whole sticker, not just the box, centers in the Begin bar. */
+    margin-bottom: 3px;
     transition: opacity 0.2s, box-shadow 0.2s;
 }
 
@@ -5468,7 +5471,10 @@ body[data-session-active] .mobile-more-sheet .mobile-more-divider {
        swapped for a 3-column grid - Begin stays dead center, the chip centers
        in the gap between Begin and the page edge and can never overlap. */
     .setup-footer {
-        padding: 0.3rem 1.5rem;
+        /* The nav below is 3.925rem + 1px tall (see its rule) and this bar
+           sits at 3.9rem, so the nav covers that much of the bottom padding;
+           add it back so Begin stays centered in what shows. */
+        padding: 0.3rem 1.5rem calc(0.325rem + 1px);
         display: grid;
         grid-template-columns: 1fr auto 1fr;
         align-items: center;
