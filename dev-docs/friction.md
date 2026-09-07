@@ -18,3 +18,5 @@ filed. Length should mean unresolved friction, not history.
 dev-docs/manual-smoke.md (`meditation-pal-nx1d`, closed). Earlier triage
 2026-08-05: session.ts size (`meditation-pal-e89d`), phone-dev cheatsheet section
 (`meditation-pal-75p1`), recognizer event fixtures (`meditation-pal-x11x`).*
+
+- **bd git hook does not stage `.beads/interactions.jsonl`** (bd 1.2.2, hook shim 1.1.2 and the fresh `bd hooks install` alike): the pre-commit hook stages `beads.jsonl`/`issues.jsonl`/`deletions.jsonl` only, so every bd close/update leaves interactions.jsonl dirty after an agent session. Patched locally on 2026-09-06 by adding it to the loop in `.git/hooks/pre-commit`; upstream beads should add it. Re-apply after any `bd hooks install`.
