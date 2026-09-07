@@ -9,16 +9,18 @@
  *     click). requestPermissions() runs lazily inside start() so callers don't
  *     have to remember.
  *   - Native APIs auto-stop on end-of-speech. The plugin (v7) has no continuous
- *     mode on Android, so to hold a turn open across a mid-thought pause we
+ *     mode, so to hold a turn open across a mid-thought pause we
  *     restart-stitch: fold each segment's transcript and relaunch the recognizer
  *     until submitDelayMs of real silence elapses (see start()). submitDelayMs=0
- *     keeps the old one-utterance-per-turn behavior.
+ *     keeps the old one-utterance-per-turn behavior. On Android the patched
+ *     plugin (patches/) keeps one SpeechRecognizer warm and flags the closing
+ *     transcript, so a relaunch costs ~50ms instead of a fresh service bind.
  *   - In a plain browser (no Capacitor runtime) this throws at start(), not at
  *     import.
  */
 
 import { SpeechRecognition } from '@capacitor-community/speech-recognition';
-import type { PluginListenerHandle } from '@capacitor/core';
+import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
 
 import type { SttEngine, SttEvent } from '../../../src/platform/stt.js';
 
@@ -50,23 +52,32 @@ export interface CapacitorSttEngineOptions {
 }
 
 /**
- * EXPERIMENT (meditation-pal-lbl5): ask Android's endpointer to tolerate this
- * long a pause before it ends the utterance. Stock ends a segment on ~1.5s,
- * and every segment boundary costs a 1.2-2.7s recognizer restart during which
- * nothing is heard - the mid-sentence word drops on device STT. The extras
- * are a hint the recognizer may ignore - and Google's on a OnePlus 13 (CPH2655, Android 16) does
- * (2026-09-05: 2/4/3 segments per turn and the same 1-3s gaps with 4000ms
- * as without). Left on because it costs nothing and other recognizers may
- * honour it; the real fix is on the restart path (see the bead).
+ * How long a silence the native recognizer tolerates before it closes a
+ * session on its own (meditation-pal-lbl5). Measured on the OnePlus 13: the
+ * stock ~2.5s no-speech timeout became 4.0s with a 4000ms hint, so the hint
+ * is honoured for that timeout (not for the in-utterance endpointer, which
+ * keeps firing end-of-speech but, in dictation mode, leaves the session
+ * open). Set long so a session spans a whole turn: the adapter's own
+ * end-of-turn timer (submitDelayMs + ramp) decides when the turn is over and
+ * closes the session, and the recognizer's timeout is only the backstop for
+ * a turn with no speech at all. Must stay under IDLE_TIMEOUT_MS.
  */
-const NATIVE_ENDPOINT_SILENCE_MS = 4000;
+const NATIVE_ENDPOINT_SILENCE_MS = 12000;
 
 const RESTART_GAP_MS = 50;
+// iOS only: how long after end-of-speech to wait for the closing transcript
+// before folding the segment. Android's patched plugin flags that transcript
+// (`final`) and reports the session's end, so it never runs this timer.
 const SEGMENT_SETTLE_MS = 700;
+// Android SpeechRecognizer error codes the patched plugin passes through.
+const ERR_CLIENT = 5;
+const ERR_SPEECH_TIMEOUT = 6;
+const ERR_NO_MATCH = 7;
+const ERR_BUSY = 8;
 // A silence error this soon after a launch belongs to the previous segment:
 // Android needs seconds of quiet to decide it heard nothing. (wlp9: ~12ms.)
 const STALE_SILENCE_GUARD_MS = 300;
-const IDLE_TIMEOUT_MS = 15000;
+const IDLE_TIMEOUT_MS = 20000;
 // The relaunched native recognizer isn't actually listening the instant
 // start() is called - Android spends a few hundred ms warming up (and clips
 // the first syllable). Treat that as deaf time too when crediting the pause
@@ -203,6 +214,15 @@ export class CapacitorSttEngine implements SttEngine {
         // (submitDelayMs === 0): finalize a short debounce after 'stopped'.
         const { submitDelayMs, submitMaxDelayMs, submitRampRate } = this.options;
         const stitching = submitDelayMs > 0;
+        // Android (patched plugin): a recognition session ends only at its
+        // final transcript or an error, and the plugin serialises a start()
+        // that lands during a live session. In dictation mode the session
+        // outlives end-of-speech - a second 'started' can follow 'stopped' -
+        // so tearing it down at 'stopped' (the pre-2026-09 design) both lost
+        // the words that followed and drew ERROR_CLIENT from the restart
+        // (meditation-pal-lbl5). Here 'stopped' is informational; the segment
+        // folds on `final`. iOS keeps the settle-timer fold.
+        const nativeSessionEvents = Capacitor.getPlatform() === 'android';
 
         let accumulated = ''; // folded transcript from prior segments this turn
         let segmentText = ''; // current segment's latest partial
@@ -372,6 +392,10 @@ export class CapacitorSttEngine implements SttEngine {
         const onLiveSpeech = (text: string): void => {
             if (submitted || done) return;
             markStarted(); // a partial proves the recognizer came up
+            // An empty partial is the recognizer hearing sound it can't
+            // transcribe (its own start tone, the room). Not speech: it must
+            // not arm the end-of-turn window or count as a segment.
+            if (!text.trim()) return;
             if (!sawSpeech) {
                 sawSpeech = true;
                 console.info('[stt-native] first partial received');
@@ -390,12 +414,36 @@ export class CapacitorSttEngine implements SttEngine {
 
         this.partialListener = await SpeechRecognition.addListener('partialResults', (data) => {
             const text = ((data as { matches?: string[] }).matches ?? [])[0];
-            if (text === undefined || submitted || done) return;
+            const isFinal = (data as { final?: boolean }).final === true;
+            if (submitted || done || (text === undefined && !isFinal)) return;
+            console.debug(`[stt-native] ${isFinal ? 'final' : 'partial'} ${text?.length ?? 'no'} chars`);
+            if (isFinal) {
+                // The session closed (patched Android plugin). It usually
+                // brings no transcript of its own - the last partial stands -
+                // but when it does, adopt it. Then fold and relaunch, or with
+                // no stitching, submit.
+                markStarted();
+                if (text?.trim()) {
+                    if (segmentHasSpeech) {
+                        segmentText = text;
+                        push({ type: 'partial', text: combined() });
+                    } else {
+                        onLiveSpeech(text); // a short utterance with no interim partial
+                    }
+                }
+                segmentStopped = true;
+                stoppedAt = Date.now(); // the mic is deaf from here to the next 'ready'
+                if (stitching) foldSegment();
+                else submit();
+                return;
+            }
+            if (text === undefined) return;
             if (segmentStopped) {
-                // Post-'stopped' final delivery of the segment that just ended:
-                // adopt the (usually cleaner) final text for the live preview,
-                // but the segment is over - don't touch the end-of-turn window
-                // or the pending restart.
+                // Post-'stopped' delivery of the utterance that just ended:
+                // adopt the (usually cleaner) text for the preview, but the
+                // utterance is over - don't touch the end-of-turn window. On
+                // Android the session may go on to a NEW utterance, whose
+                // partials start from empty; 'started' folds this one first.
                 segmentText = text;
                 push({ type: 'partial', text: combined() });
                 if (!stitching) {
@@ -415,13 +463,32 @@ export class CapacitorSttEngine implements SttEngine {
                 // speech began - also proof of life, and the only signal on
                 // builds without the patch (or iOS).
                 markStarted();
+                if (status === 'started' && segmentStopped && stitching) {
+                    // Android dictation: a new utterance in the same session.
+                    // Its partials replace, not extend, the last one's text,
+                    // so bank the finished utterance now.
+                    if (segmentText) {
+                        accumulated = combined();
+                        segmentText = '';
+                    }
+                    segmentStopped = false;
+                    segmentHasSpeech = false;
+                }
                 return;
             }
             if (status === 'error') {
                 const msg = (data as { message?: string }).message ?? 'recognizer error';
+                const code = (data as { errorCode?: number }).errorCode;
                 if (submitted || done || this.stopRequested || relaunching) return;
-                // NO_MATCH / SPEECH_TIMEOUT: ordinary silence, not a fault.
-                if (/didn't understand|no match|no speech/i.test(msg)) {
+                // NO_MATCH / SPEECH_TIMEOUT: ordinary silence, not a fault. The
+                // code is authoritative when the plugin sends one; the text
+                // match covers iOS and unpatched builds.
+                const silence =
+                    code !== undefined
+                        ? code === ERR_NO_MATCH || code === ERR_SPEECH_TIMEOUT
+                        : /didn't understand|no match|no speech/i.test(msg);
+                const busy = code !== undefined ? code === ERR_BUSY || code === ERR_CLIENT : /busy|client side/i.test(msg);
+                if (silence) {
                     // Not ours if this segment hasn't come up yet - it's the
                     // previous one's, and acting on it cost every turn its first
                     // ~650ms (meditation-pal-wlp9). Time-bounded so an engine
@@ -446,7 +513,7 @@ export class CapacitorSttEngine implements SttEngine {
                 }
                 // BUSY / flaky client errors: the service didn't take the
                 // launch. Relaunch on the watchdog's retry budget.
-                if (/busy|client side/i.test(msg) && startRetries < MAX_START_RETRIES) {
+                if (busy && startRetries < MAX_START_RETRIES) {
                     startRetries++;
                     console.info(
                         `[stt-native] recognizer error "${msg}" - relaunch ${startRetries}/${MAX_START_RETRIES}`
@@ -465,34 +532,44 @@ export class CapacitorSttEngine implements SttEngine {
             if (status !== 'stopped' || submitted || done) return;
             segmentStopped = true;
             // Mark when the mic went deaf so restartSegment can credit the gap.
-            if (stoppedAt === 0) stoppedAt = Date.now();
+            // Not on Android: the session (and the mic) outlives end-of-speech
+            // there, and the deaf moment is the session's close (`final` /
+            // silence error), which sets it.
+            if (!nativeSessionEvents && stoppedAt === 0) stoppedAt = Date.now();
             if (!stitching) {
                 // Legacy: submit a short debounce after end-of-speech; a
                 // post-stop final re-arms it (above) so the cleaner text wins.
+                // Android submits on `final` instead; the timer is a backstop.
                 if (settleTimer !== null) clearTimeout(settleTimer);
                 settleTimer = setTimeout(submit, 2500);
                 return;
             }
-            // Settle briefly to catch the post-'stopped' final transcript, then
-            // fold and relaunch to catch a continuation. The end-of-turn timer,
-            // armed from the last LIVE utterance, is what actually ends the turn.
+            // Android: the session is still open; its `final` (or a silence
+            // error) closes the segment. iOS: settle briefly to catch the
+            // post-'stopped' transcript, then fold and relaunch.
+            if (nativeSessionEvents) return;
             if (settleTimer !== null) clearTimeout(settleTimer);
-            settleTimer = setTimeout(() => {
-                settleTimer = null;
-                if (submitted || done) return;
-                if (segmentText) {
-                    accumulated = combined();
-                    segmentText = '';
-                }
-                if (sawSpeech && accumulated) {
-                    // A turn is in progress; keep the mic available for a
-                    // continuation until the end-of-turn timer fires.
-                    void restartSegment();
-                } else {
-                    submit(); // silent turn: let the listen loop start fresh
-                }
-            }, SEGMENT_SETTLE_MS);
+            settleTimer = setTimeout(foldSegment, SEGMENT_SETTLE_MS);
         });
+
+        // The segment that just ended is complete: fold its text into the
+        // turn and relaunch for a continuation, or end a silent turn. The
+        // end-of-turn timer, armed from the last LIVE utterance, is what
+        // actually ends a turn with speech in it.
+        const foldSegment = (): void => {
+            if (settleTimer !== null) clearTimeout(settleTimer);
+            settleTimer = null;
+            if (submitted || done) return;
+            if (segmentText) {
+                accumulated = combined();
+                segmentText = '';
+            }
+            if (sawSpeech && accumulated) {
+                void restartSegment();
+            } else {
+                submit(); // silent turn: let the listen loop start fresh
+            }
+        };
 
         // Launch (or relaunch) one native recognition segment.
         const launchSegment = (): void => {

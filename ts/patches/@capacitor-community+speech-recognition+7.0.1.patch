@@ -1,8 +1,46 @@
 diff --git a/node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java b/node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java
-index a99ea69..d2b0a3e 100644
+index a99ea69..e21dc58 100644
 --- a/node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java
 +++ b/node_modules/@capacitor-community/speech-recognition/android/src/main/java/com/getcapacitor/community/speechrecognition/SpeechRecognition.java
-@@ -81,7 +81,8 @@ public class SpeechRecognition extends Plugin implements Constants {
+@@ -39,6 +39,26 @@ public class SpeechRecognition extends Plugin implements Constants {
+ 
+     private final ReentrantLock lock = new ReentrantLock();
+     private boolean listening = false;
++    // aloud patch: one SpeechRecognizer for the life of the plugin. The
++    // stock plugin destroyed and recreated it on every start(), which on a
++    // segment-stitching client means a fresh service bind (1-3s deaf) per
++    // pause and ERROR_CLIENT when the new bind raced the old teardown
++    // (meditation-pal-lbl5). `sessionActive` spans startListening ->
++    // onResults/onError; nothing here cancels or destroys a live session.
++    private SpeechRecognitionListener recognitionListener;
++    private boolean sessionActive = false;
++    private boolean recognizerBroken = false;
++    // A start() that arrived while a session was still open. The framework
++    // rejects startListening right after cancel() with ERROR_CLIENT, so
++    // instead the live session is asked to finish (stopListening) and this
++    // intent launches from onResults/onError once it has.
++    private Intent pendingIntent;
++    // The recognition service plays a short earcon on the notification stream
++    // at every session start and end (seen as USAGE_ASSISTANCE_SONIFICATION
++    // AudioTracks from its process). Mute that stream while a session is
++    // open; the mute is per-app and the system clears it if we die.
++    private boolean notificationsMuted = false;
++    private final Runnable unmuteRunnable = this::unmuteNotifications;
+ 
+     private JSONArray previousPartialResults = new JSONArray();
+ 
+@@ -48,9 +68,7 @@ public class SpeechRecognition extends Plugin implements Constants {
+         bridge
+             .getWebView()
+             .post(() -> {
+-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(bridge.getActivity());
+-                SpeechRecognitionListener listener = new SpeechRecognitionListener();
+-                speechRecognizer.setRecognitionListener(listener);
++                ensureRecognizer();
+                 Logger.info(getLogTag(), "Instantiated SpeechRecognizer in load()");
+             });
+     }
+@@ -81,7 +99,8 @@ public class SpeechRecognition extends Plugin implements Constants {
          String prompt = call.getString("prompt", null);
          boolean partialResults = call.getBoolean("partialResults", false);
          boolean popup = call.getBoolean("popup", false);
@@ -12,7 +50,7 @@ index a99ea69..d2b0a3e 100644
      }
  
      @PluginMethod
-@@ -157,6 +158,7 @@ public class SpeechRecognition extends Plugin implements Constants {
+@@ -157,6 +176,7 @@ public class SpeechRecognition extends Plugin implements Constants {
          String prompt,
          final boolean partialResults,
          boolean showPopup,
@@ -20,7 +58,7 @@ index a99ea69..d2b0a3e 100644
          PluginCall call
      ) {
          Logger.info(getLogTag(), "Beginning to listen for audible speech");
-@@ -169,6 +171,17 @@ public class SpeechRecognition extends Plugin implements Constants {
+@@ -169,6 +189,17 @@ public class SpeechRecognition extends Plugin implements Constants {
          intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, partialResults);
          intent.putExtra("android.speech.extra.DICTATION_MODE", partialResults);
  
@@ -38,7 +76,162 @@ index a99ea69..d2b0a3e 100644
          if (prompt != null) {
              intent.putExtra(RecognizerIntent.EXTRA_PROMPT, prompt);
          }
-@@ -239,7 +252,15 @@ public class SpeechRecognition extends Plugin implements Constants {
+@@ -182,19 +213,19 @@ public class SpeechRecognition extends Plugin implements Constants {
+                     try {
+                         SpeechRecognition.this.lock.lock();
+ 
+-                        if (speechRecognizer != null) {
+-                            speechRecognizer.cancel();
+-                            speechRecognizer.destroy();
+-                            speechRecognizer = null;
++                        ensureRecognizer();
++                        recognitionListener.setCall(call);
++                        recognitionListener.setPartialResults(partialResults);
++                        if (sessionActive) {
++                            android.util.Log.d("AloudSTT", "start deferred: session still open");
++                            pendingIntent = intent;
++                            if (SpeechRecognition.this.listening) {
++                                speechRecognizer.stopListening();
++                                SpeechRecognition.this.listening(false);
++                            }
++                        } else {
++                            launch(intent);
+                         }
+-
+-                        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(bridge.getActivity());
+-                        SpeechRecognitionListener listener = new SpeechRecognitionListener();
+-                        listener.setCall(call);
+-                        listener.setPartialResults(partialResults);
+-                        speechRecognizer.setRecognitionListener(listener);
+-                        speechRecognizer.startListening(intent);
+-                        SpeechRecognition.this.listening(true);
+                         if (partialResults) {
+                             call.resolve();
+                         }
+@@ -213,10 +244,12 @@ public class SpeechRecognition extends Plugin implements Constants {
+             .post(() -> {
+                 try {
+                     SpeechRecognition.this.lock.lock();
+-                    if (SpeechRecognition.this.listening) {
++                    // Only a live session may be stopped: the framework answers
++                    // stopListening() on a closed one with ERROR_CLIENT.
++                    if (SpeechRecognition.this.listening && SpeechRecognition.this.sessionActive && speechRecognizer != null) {
+                         speechRecognizer.stopListening();
+-                        SpeechRecognition.this.listening(false);
+                     }
++                    SpeechRecognition.this.listening(false);
+                 } catch (Exception ex) {
+                     throw ex;
+                 } finally {
+@@ -225,6 +258,107 @@ public class SpeechRecognition extends Plugin implements Constants {
+             });
+     }
+ 
++    private void setNotificationsMuted(boolean mute) {
++        if (mute == notificationsMuted) {
++            return;
++        }
++        try {
++            android.media.AudioManager am = (android.media.AudioManager) bridge
++                .getActivity()
++                .getSystemService(android.content.Context.AUDIO_SERVICE);
++            am.adjustStreamVolume(
++                android.media.AudioManager.STREAM_NOTIFICATION,
++                mute ? android.media.AudioManager.ADJUST_MUTE : android.media.AudioManager.ADJUST_UNMUTE,
++                0
++            );
++            notificationsMuted = mute;
++        } catch (Exception ex) {
++            // Do Not Disturb can refuse; the earcon is then merely audible.
++            android.util.Log.d("AloudSTT", "notification mute refused: " + ex.getMessage());
++        }
++    }
++
++    private void unmuteNotifications() {
++        if (!sessionActive) {
++            setNotificationsMuted(false);
++        }
++    }
++
++    // The session closed: lift the mute once its end tone has had time to
++    // play into silence, unless another session opens first.
++    private void scheduleUnmute() {
++        bridge.getWebView().removeCallbacks(unmuteRunnable);
++        bridge.getWebView().postDelayed(unmuteRunnable, 800);
++    }
++
++    @Override
++    protected void handleOnPause() {
++        super.handleOnPause();
++        setNotificationsMuted(false);
++    }
++
++    // Main thread, lock held, no session open.
++    private void launch(Intent intent) {
++        android.util.Log.d("AloudSTT", "startListening");
++        bridge.getWebView().removeCallbacks(unmuteRunnable);
++        setNotificationsMuted(true);
++        previousPartialResults = new JSONArray();
++        pendingIntent = null;
++        speechRecognizer.startListening(intent);
++        sessionActive = true;
++        listening(true);
++    }
++
++    // The open session just closed (onResults / onError): run the start() that
++    // was waiting on it, if any. Runs on the main thread.
++    private void launchPending() {
++        Intent intent = pendingIntent;
++        pendingIntent = null;
++        if (intent == null) {
++            return;
++        }
++        try {
++            lock.lock();
++            ensureRecognizer();
++            launch(intent);
++        } finally {
++            lock.unlock();
++        }
++    }
++
++    // aloud patch: build the recognizer only when there is none, or when the
++    // last session ended in a fault that leaves the instance unusable
++    // (ERROR_CLIENT / ERROR_SERVER / ERROR_AUDIO). Silence (NO_MATCH,
++    // SPEECH_TIMEOUT) is a normal session end and keeps the instance warm.
++    // Must run on the main thread with the lock held.
++    private void ensureRecognizer() {
++        if (speechRecognizer != null && !recognizerBroken) {
++            return;
++        }
++        if (speechRecognizer != null) {
++            android.util.Log.d("AloudSTT", "Rebuilding SpeechRecognizer after a fault");
++            speechRecognizer.destroy();
++            speechRecognizer = null;
++        }
++        // aloud patch: prefer the on-device recognizer (API 31+). The default
++        // (Google app) service plays a start tone that its own endpointer
++        // then hears as speech - a no-match restart loop with a beep every
++        // few seconds on the OnePlus 13 (meditation-pal-lbl5).
++        if (Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(bridge.getActivity())) {
++            speechRecognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(bridge.getActivity());
++            android.util.Log.d("AloudSTT", "using on-device recognizer");
++        } else {
++            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(bridge.getActivity());
++            android.util.Log.d("AloudSTT", "using default recognizer");
++        }
++        if (recognitionListener == null) {
++            recognitionListener = new SpeechRecognitionListener();
++        }
++        speechRecognizer.setRecognitionListener(recognitionListener);
++        recognizerBroken = false;
++        sessionActive = false;
++    }
++
+     private class SpeechRecognitionListener implements RecognitionListener {
+ 
+         private PluginCall call;
+@@ -239,7 +373,15 @@ public class SpeechRecognition extends Plugin implements Constants {
          }
  
          @Override
@@ -55,8 +248,33 @@ index a99ea69..d2b0a3e 100644
  
          @Override
          public void onBeginningOfSpeech() {
-@@ -283,6 +304,16 @@ public class SpeechRecognition extends Plugin implements Constants {
-             SpeechRecognition.this.stopListening();
+@@ -262,6 +404,7 @@ public class SpeechRecognition extends Plugin implements Constants {
+ 
+         @Override
+         public void onEndOfSpeech() {
++            android.util.Log.d("AloudSTT", "onEndOfSpeech");
+             bridge
+                 .getWebView()
+                 .post(() -> {
+@@ -280,33 +423,80 @@ public class SpeechRecognition extends Plugin implements Constants {
+ 
+         @Override
+         public void onError(int error) {
+-            SpeechRecognition.this.stopListening();
++            android.util.Log.d("AloudSTT", "onError " + error);
++            SpeechRecognition.this.sessionActive = false;
++            SpeechRecognition.this.listening(false);
++            // Faults that leave the instance unusable; silence (6/7) and busy
++            // (8) are normal session ends. 11 = ERROR_SERVER_DISCONNECTED.
++            if (
++                error == SpeechRecognizer.ERROR_CLIENT ||
++                error == SpeechRecognizer.ERROR_SERVER ||
++                error == SpeechRecognizer.ERROR_AUDIO ||
++                error == 11
++            ) {
++                SpeechRecognition.this.recognizerBroken = true;
++                SpeechRecognition.this.pendingIntent = null;
++            }
              String errorMssg = getErrorText(error);
  
 +            // aloud patch: in partialResults mode the start() call was already
@@ -72,11 +290,90 @@ index a99ea69..d2b0a3e 100644
              if (this.call != null) {
                  call.reject(errorMssg);
              }
++            SpeechRecognition.this.launchPending();
++            if (!SpeechRecognition.this.sessionActive) {
++                SpeechRecognition.this.scheduleUnmute();
++            }
+         }
+ 
+         @Override
+         public void onResults(Bundle results) {
++            SpeechRecognition.this.sessionActive = false;
++            SpeechRecognition.this.listening(false);
+             ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
++            android.util.Log.d("AloudSTT", "onResults " + (matches == null ? "null" : matches.size()));
++            if (SpeechRecognition.this.pendingIntent != null) {
++                // JS already replaced this session; its transcript would land
++                // in the next turn as live speech.
++                SpeechRecognition.this.launchPending();
++                return;
++            }
+ 
+             try {
+-                JSArray jsArray = new JSArray(matches);
++                // aloud patch: in dictation mode the closing onResults often
++                // carries NO matches (the last partial was the transcript).
++                // It still marks the session's end, so JS must hear it.
++                JSArray jsArray = new JSArray(matches == null ? new ArrayList<String>() : matches);
+ 
+                 if (this.call != null) {
+                     if (!this.partialResults) {
+                         this.call.resolve(new JSObject().put("status", "success").put("matches", jsArray));
+                     } else {
++                        // aloud patch: `final` lets JS tell the session's
++                        // closing transcript from an interim one on the same
++                        // event, so it can relaunch the moment it lands.
+                         JSObject ret = new JSObject();
+                         ret.put("matches", jsArray);
++                        ret.put("final", true);
+                         notifyListeners("partialResults", ret);
+                     }
+                 }
+             } catch (Exception ex) {
+                 this.call.resolve(new JSObject().put("status", "error").put("message", ex.getMessage()));
+             }
++            SpeechRecognition.this.launchPending();
++            if (!SpeechRecognition.this.sessionActive) {
++                SpeechRecognition.this.scheduleUnmute();
++            }
+         }
+ 
+         @Override
+@@ -358,6 +548,20 @@ public class SpeechRecognition extends Plugin implements Constants {
+             case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
+                 message = "No speech input";
+                 break;
++            // aloud patch: API 31+ codes the stock switch folded into the
++            // "Didn't understand" default, which JS reads as silence.
++            case 10:
++                message = "Too many requests";
++                break;
++            case 11:
++                message = "Recognition service disconnected";
++                break;
++            case 12:
++                message = "Language not supported";
++                break;
++            case 13:
++                message = "Language unavailable";
++                break;
+             default:
+                 message = "Didn't understand, please try again.";
+                 break;
 diff --git a/node_modules/@capacitor-community/speech-recognition/dist/esm/definitions.d.ts b/node_modules/@capacitor-community/speech-recognition/dist/esm/definitions.d.ts
-index a80565c..ba56612 100644
+index a80565c..f47358e 100644
 --- a/node_modules/@capacitor-community/speech-recognition/dist/esm/definitions.d.ts
 +++ b/node_modules/@capacitor-community/speech-recognition/dist/esm/definitions.d.ts
-@@ -119,4 +119,10 @@ export interface UtteranceOptions {
+@@ -82,6 +82,8 @@ export interface SpeechRecognitionPlugin {
+      */
+     addListener(eventName: 'partialResults', listenerFunc: (data: {
+         matches: string[];
++        /** aloud patch (Android): true on the session's closing transcript. */
++        final?: boolean;
+     }) => void): Promise<PluginListenerHandle>;
+     /**
+      * Called when listening state changed.
+@@ -119,4 +121,10 @@ export interface UtteranceOptions {
       * return partial results if found
       */
      partialResults?: boolean;

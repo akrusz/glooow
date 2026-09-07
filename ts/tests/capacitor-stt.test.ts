@@ -81,7 +81,7 @@ describe('CapacitorSttEngine restart-stitching', () => {
         await vi.advanceTimersByTimeAsync(60); // permission + 50ms reset, listeners, launch #1
         expect(H.start).toHaveBeenCalledTimes(1);
         // The endpointer hint (meditation-pal-lbl5) rides every launch.
-        expect(H.start.mock.calls[0]![0]).toMatchObject({ silenceLengthMs: 4000, popup: false });
+        expect(H.start.mock.calls[0]![0]).toMatchObject({ silenceLengthMs: 12000, popup: false });
 
         partial('I notice'); // live speech
         stopped(); // Android end-of-speech
@@ -344,5 +344,96 @@ describe('stale silence errors (meditation-pal-wlp9)', () => {
         expect(ended).toBe(true); // an empty turn ends silently, emitting no final
         expect(finals(events)).toEqual([]);
         await finished;
+    });
+});
+
+/**
+ * Android session semantics (meditation-pal-lbl5, 2026-09-06). The patched
+ * plugin keeps one SpeechRecognizer warm; a session outlives end-of-speech in
+ * dictation mode and closes only with a `final`-flagged partialResults event
+ * (usually with NO text - the last partial was the transcript) or an error.
+ * The engine keys this on Capacitor.getPlatform() === 'android'.
+ */
+describe('Android native session events', () => {
+    const P = vi.hoisted(() => ({ platform: 'web' }));
+    vi.mock('@capacitor/core', () => ({ Capacitor: { getPlatform: () => P.platform } }));
+    const started = (): void => H.listeners.get('listeningState')?.({ status: 'started' });
+    const finalClose = (text?: string): void =>
+        H.listeners.get('partialResults')?.({ matches: text === undefined ? [] : [text], final: true });
+    const codedError = (errorCode: number, message: string): void =>
+        H.listeners.get('listeningState')?.({ status: 'error', message, errorCode });
+
+    beforeEach(() => {
+        P.platform = 'android';
+        vi.spyOn(console, 'debug').mockImplementation(() => {});
+    });
+    afterEach(() => {
+        P.platform = 'web';
+    });
+
+    it("end-of-speech alone does not relaunch; the session's textless close does", async () => {
+        const engine = new CapacitorSttEngine(OPTS);
+        const { events } = collect(engine);
+        await vi.advanceTimersByTimeAsync(60);
+        expect(H.start).toHaveBeenCalledTimes(1);
+
+        partial('I notice');
+        stopped(); // Android end-of-speech: the session is still open
+        await vi.advanceTimersByTimeAsync(1500); // well past the iOS settle timer
+        expect(H.start).toHaveBeenCalledTimes(1);
+
+        finalClose(); // the session closes with no transcript of its own
+        await vi.advanceTimersByTimeAsync(100);
+        expect(H.start).toHaveBeenCalledTimes(2); // relaunched to catch a continuation
+        expect(finals(events)).toEqual([]);
+
+        await vi.advanceTimersByTimeAsync(6000);
+        expect(finals(events)).toEqual([{ type: 'final', text: 'I notice' }]);
+    });
+
+    it("a new utterance in the same session ('started' after 'stopped') banks the last one", async () => {
+        const engine = new CapacitorSttEngine(OPTS);
+        const { events } = collect(engine);
+        await vi.advanceTimersByTimeAsync(60);
+
+        partial('I notice a tightness');
+        stopped();
+        partial('I notice a tightness.'); // tail refinement of the ended utterance
+        started(); // the session heard the next utterance
+        partial(''); // its partials start from empty ...
+        partial('in my chest'); // ... and replace, not extend
+        finalClose();
+        await vi.advanceTimersByTimeAsync(6000);
+
+        expect(finals(events)).toEqual([{ type: 'final', text: 'I notice a tightness. in my chest' }]);
+    });
+
+    it('an empty partial (the recognizer hearing its own tone) does not arm the end-of-turn window', async () => {
+        const engine = new CapacitorSttEngine(OPTS);
+        const { events } = collect(engine);
+        await vi.advanceTimersByTimeAsync(60);
+
+        partial('yeah');
+        await vi.advanceTimersByTimeAsync(4000);
+        partial(''); // 1s before the window would close: must not push it out
+        await vi.advanceTimersByTimeAsync(1200);
+        expect(finals(events)).toEqual([{ type: 'final', text: 'yeah' }]);
+    });
+
+    it('classifies errors by code: 7 is silence, 11 is a fault, whatever the text says', async () => {
+        const engine = new CapacitorSttEngine(OPTS);
+        const { events } = collect(engine);
+        await vi.advanceTimersByTimeAsync(60);
+
+        codedError(7, "Didn't understand, please try again.");
+        await vi.advanceTimersByTimeAsync(100);
+        expect(events.filter((e) => e.type === 'error')).toEqual([]); // silent turn, no fault
+
+        const engine2 = new CapacitorSttEngine(OPTS);
+        const { events: events2 } = collect(engine2);
+        await vi.advanceTimersByTimeAsync(60);
+        codedError(11, "Didn't understand, please try again.");
+        await vi.advanceTimersByTimeAsync(100);
+        expect(events2.filter((e) => e.type === 'error')).toHaveLength(1);
     });
 });

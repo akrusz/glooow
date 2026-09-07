@@ -48,14 +48,30 @@ straight from `node_modules`, so the patch is load-bearing at build time).
 Stock v7 leaves `onReadyForSpeech` empty and, in partial-results mode, rejects an
 already-resolved call on `onError` - so JS saw neither "recognizer is live" nor
 any error (NO_MATCH, SPEECH_TIMEOUT, BUSY). The patch emits `listeningState:
-'ready'` and `listeningState: 'error'`; `CapacitorSttEngine` keys its startup
+'ready'` and `listeningState: 'error'` (with the numeric `errorCode`, since
+stock maps the API 31+ codes such as SERVER_DISCONNECTED to "Didn't
+understand", which reads as silence); `CapacitorSttEngine` keys its startup
 watchdog and silence handling on them. Note the stock `'started'` event is
-`onBeginningOfSpeech` - user speech, not launch. The patch also adds a
-`silenceLengthMs` start option that sets Android's
-`EXTRA_SPEECH_INPUT_*_SILENCE_LENGTH_MILLIS` endpointer extras; the adapter
-sends `NATIVE_ENDPOINT_SILENCE_MS` on every launch (an experiment against the
-mid-sentence restart gaps, `meditation-pal-lbl5` - recognizers honour it
-unevenly). To change the patch: edit under `node_modules`, then
+`onBeginningOfSpeech` - user speech, not launch.
+
+The Android session model (`meditation-pal-lbl5`, 2026-09-06) is the bigger
+patch. Stock destroyed and recreated the `SpeechRecognizer` on every `start()`
+(a fresh service bind per segment, 1-3s deaf, ERROR_CLIENT when the bind raced
+the old teardown). Patched: one recognizer for the life of the plugin, created
+with `createOnDeviceSpeechRecognizer` where available; nothing in the loop
+cancels or destroys it, and a `start()` that lands on a live session is queued
+until that session closes. The close is reported as a `partialResults` event
+with `final: true` (usually with no matches - in dictation mode the last partial
+was the transcript), so the adapter folds the segment and relaunches in ~50ms.
+The `silenceLengthMs` start option sets Android's
+`EXTRA_SPEECH_INPUT_*_SILENCE_LENGTH_MILLIS` extras; on the OnePlus 13 that
+governs the no-speech timeout (and roughly the session length), not the
+in-utterance endpointer, so the adapter sends a long
+`NATIVE_ENDPOINT_SILENCE_MS` and its own end-of-turn timer owns the turn. The
+recognition service also plays an earcon on the notification stream at every
+session start and end (heard by its own endpointer - a restart loop with a
+beep every few seconds); the plugin mutes that stream while a session is open.
+To change the patch: edit under `node_modules`, then
 `npx patch-package @capacitor-community/speech-recognition --exclude 'android/build'`
 (the exclude keeps gradle's build artifacts out of the diff).
 
