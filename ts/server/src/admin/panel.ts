@@ -292,6 +292,7 @@ const ADMIN_PANEL_TEMPLATE = String.raw`<!doctype html>
           <tbody id="incidentRows"><tr><td colspan="6" class="muted">Connect to load.</td></tr></tbody>
         </table>
       </div>
+      <div id="incidentPager" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:10px"></div>
     </div>
 
     <h2 id="sec-cost">Cost attribution
@@ -558,10 +559,38 @@ const ADMIN_PANEL_TEMPLATE = String.raw`<!doctype html>
 
   // ---- incidents ---------------------------------------------------------
   // One pill per kind stands in for a stat grid: the count is what matters,
-  // the accounts/sessions behind it ride the hover. Compact view shows the
-  // newest COMPACT_INCIDENT_ROWS rows; the rest are .detail.
-  var COMPACT_INCIDENT_ROWS = 8;
-  function loadIncidents() {
+  // the accounts/sessions behind it ride the hover. The table pages newest
+  // first, like history: page size follows the view (8 compact / 20 full).
+  var INCIDENTS = [];
+  var incidentPage = 0;
+  function incidentPageSize() { return document.body.classList.contains('compact') ? 8 : 20; }
+
+  function renderIncidents() {
+    var size = incidentPageSize();
+    var pages = Math.max(1, Math.ceil(INCIDENTS.length / size));
+    if (incidentPage > pages - 1) incidentPage = pages - 1;
+    if (incidentPage < 0) incidentPage = 0;
+    var page = INCIDENTS.slice(incidentPage * size, (incidentPage + 1) * size);
+    $('incidentRows').innerHTML = page.map(function (i) {
+      return '<tr><td class="muted" style="white-space:nowrap">' + dateTime(i.ts) + '</td><td>' + esc(i.kind) +
+        '</td><td>' + esc(i.account) + '</td><td class="muted">' + esc(i.sessionId ? String(i.sessionId).slice(0, 8) : '') +
+        '</td><td title="' + esc(i.provider) + '" style="white-space:nowrap"><code>' + esc(i.model) + '</code></td><td class="muted clip" title="' + esc(i.detail) + '">' + esc(i.detail) + '</td></tr>';
+    }).join('') || '<tr><td colspan="6" class="muted">No incidents in this window.</td></tr>';
+    if (pages <= 1) {
+      $('incidentPager').innerHTML = '';
+    } else {
+      $('incidentPager').innerHTML =
+        '<button class="ghost xs" id="incPrev"' + (incidentPage === 0 ? ' disabled' : '') + '>← newer</button>' +
+        '<span class="muted" style="font-size:15px">page ' + (incidentPage + 1) + ' of ' + pages + '</span>' +
+        '<button class="ghost xs" id="incNext"' + (incidentPage >= pages - 1 ? ' disabled' : '') + '>older →</button>';
+      $('incPrev').onclick = function () { if (incidentPage > 0) { incidentPage--; renderIncidents(); } };
+      $('incNext').onclick = function () { if (incidentPage < pages - 1) { incidentPage++; renderIncidents(); } };
+    }
+  }
+
+  // keepPage: the auto-refresh tick passes true so it doesn't yank the
+  // operator back to page 1 mid-browse (renderIncidents clamps if out of range).
+  function loadIncidents(keepPage) {
     var sel = $('incidentWindow');
     return api('/incidents?sinceHours=' + sel.value + omitAdminParam()).then(function (r) {
       var lead = '<span class="lead ' + (r.total > 0 ? 'bad' : '') + '">' + int(r.total) + ' incident' + (r.total === 1 ? '' : 's') + '</span>';
@@ -569,11 +598,9 @@ const ADMIN_PANEL_TEMPLATE = String.raw`<!doctype html>
         return '<span class="pill ' + (k.source === 'server' ? 'warn' : 'free') + '" title="' + int(k.accounts) + ' account(s), ' + int(k.sessions) + ' session(s)">' +
           esc(k.kind) + ' ×' + int(k.count) + '</span>';
       }).join('');
-      $('incidentRows').innerHTML = (r.recent || []).map(function (i, idx) {
-        return '<tr' + (idx >= COMPACT_INCIDENT_ROWS ? ' class="detail"' : '') + '><td class="muted" style="white-space:nowrap">' + dateTime(i.ts) + '</td><td>' + esc(i.kind) +
-          '</td><td>' + esc(i.account) + '</td><td class="muted">' + esc(i.sessionId ? String(i.sessionId).slice(0, 8) : '') +
-          '</td><td title="' + esc(i.provider) + '" style="white-space:nowrap"><code>' + esc(i.model) + '</code></td><td class="muted clip" title="' + esc(i.detail) + '">' + esc(i.detail) + '</td></tr>';
-      }).join('') || '<tr><td colspan="6" class="muted">No incidents in this window.</td></tr>';
+      INCIDENTS = r.recent || [];
+      if (!keepPage) incidentPage = 0;
+      renderIncidents();
     });
   }
 
@@ -1281,7 +1308,7 @@ const ADMIN_PANEL_TEMPLATE = String.raw`<!doctype html>
   var autoTimer = null;
   function autoTick() {
     if (document.hidden || $('app').classList.contains('hidden')) return;
-    Promise.all([loadMetrics(), loadUsage(), loadUsageHistory(true), loadAccounts(), loadIncidents()])
+    Promise.all([loadMetrics(), loadUsage(), loadUsageHistory(true), loadAccounts(), loadIncidents(true)])
       .catch(function () {});
   }
   function setAuto(on) {
@@ -1418,6 +1445,7 @@ const ADMIN_PANEL_TEMPLATE = String.raw`<!doctype html>
       sync();
       // The history table pages by view size.
       if (typeof HISTORY !== 'undefined' && HISTORY.length) { historyPage = 0; renderHistory(); }
+      if (INCIDENTS.length) { incidentPage = 0; renderIncidents(); }
     });
     if (loadPrefs().compact === false) document.body.classList.remove('compact');
     sync();
