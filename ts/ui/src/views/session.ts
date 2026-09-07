@@ -1850,7 +1850,7 @@ export async function mountSessionView(
                     bubble.discard();
                     hideTyping();
                     pacing.onResponseEnd();
-                    setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+                    setStatus(idleStatus());
                     return;
                 }
                 // finishReason is the one clue to WHY a completion came back
@@ -1888,7 +1888,7 @@ export async function mountSessionView(
                 tapTurn('assistant', 'reply', line, { raw: '', latencyMs: Date.now() - turnStart });
                 if (superseded()) return;
                 pacing.onResponseEnd();
-                setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+                setStatus(idleStatus());
                 return;
             }
             if (!ephemeral) session.addAssistantMessage(cleanText, undefined, usage);
@@ -1919,7 +1919,7 @@ export async function mountSessionView(
                 !ephemeral && !wasSilent && hold && pacingConfig.silenceModeEnabled;
             tapFlags({ awaitingHoldConfirm });
             if (hold) tapEvent('signal', awaitingHoldConfirm ? 'hold-bid' : 'hold-bid-ignored');
-            setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+            setStatus(idleStatus());
             pacing.onResponseEnd();
         } catch (err) {
             // The reply never made it into history: drop any partially revealed
@@ -1974,7 +1974,7 @@ export async function mountSessionView(
                 // line, and the loop resumes listening so nothing is wedged.
                 showErrorToast(describeCloudError(msg) ?? t('Something went wrong: {msg}', { msg }));
             }
-            setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+            setStatus(idleStatus());
             // Reset the check-in clock like the success path does, or a long
             // failed turn leaves a stale timestamp and the next poll fires a
             // check-in right on top of the error apology.
@@ -2261,6 +2261,13 @@ export async function mountSessionView(
     }
 
     /** Mic on/off. Unmuting is button-only - a muted mic hears no way back. */
+    // The resting status line between turns. Every reply path resets the
+    // line when it ends, and a mute set mid-reply must survive that.
+    function idleStatus(): string {
+        if (muted) return t('Muted');
+        return stt ? t('Listening…') : t('Mic unavailable');
+    }
+
     function setMuted(next: boolean): void {
         if (!stt || next === muted) return;
         if (next) {
@@ -2538,7 +2545,7 @@ export async function mountSessionView(
             }
             reveal.finalize(cleanText);
             pacing.onResponseEnd();
-            setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+            setStatus(idleStatus());
         } catch (err) {
             console.warn('LLM opener failed, using static fallback', err);
             clearSlowResponseStatus();
@@ -2555,7 +2562,7 @@ export async function mountSessionView(
                 /* non-fatal */
             }
             pacing.onResponseEnd();
-            setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+            setStatus(idleStatus());
         }
     }
 
@@ -2604,7 +2611,7 @@ export async function mountSessionView(
             }
             reveal.finalize(cleanText);
             pacing.onResponseEnd();
-            setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+            setStatus(idleStatus());
         } catch (err) {
             console.warn('Continuation opener failed', err);
             clearSlowResponseStatus();
@@ -2619,7 +2626,7 @@ export async function mountSessionView(
                 /* non-fatal */
             }
             pacing.onResponseEnd();
-            setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+            setStatus(idleStatus());
         }
     }
 
@@ -2818,7 +2825,7 @@ export async function mountSessionView(
             }
             reveal.finalize(text);
             pacing.onResponseEnd();
-            setStatus(stt ? t('Listening…') : t('Mic unavailable'));
+            setStatus(idleStatus());
         } finally {
             busy = false;
             tapFlags({ busy: false });
